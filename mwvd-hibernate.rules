@@ -1,0 +1,5 @@
+# MWVD 固件休眠分区自动配置
+# 只触发 systemd 服务；不在 udev 内执行阻塞操作。
+
+ACTION=="add", SUBSYSTEM=="misc", KERNEL=="mwvd-control", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="mwvd-hibernate-setup.service"

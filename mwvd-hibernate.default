@@ -1,0 +1,22 @@
+# MWVD 休眠分区自动配置策略
+#
+# 1 = 允许自动配置；0 = 完全关闭（helper 直接退出）
+MWVD_HIBERNATE_AUTOCONFIG=1
+#
+# 1 = 允许自动激活 swap；0 = 只生成配置
+MWVD_HIBERNATE_ACTIVATE_SWAP=1
+#
+# 1 = 自动管理引导器 cmdline：把 resume=UUID=<swap uuid> 写入
+#     /boot/loader/entries/*.conf（BLS）、/etc/kernel/cmdline（kernel-install 模板）、
+#     /etc/default/grub 的 GRUB_CMDLINE_LINUX，并在没有 BLS 时重生成 grub 配置；
+#     改动前会保留 <文件>.mwvd.bak 备份，内容未变化时不重复写。
+# 0 = 只写 initramfs 配置，resume= 由用户自行添加。
+MWVD_HIBERNATE_MANAGE_BOOT=1
+#
+# 休眠模式（写入 /etc/systemd/sleep.conf 的 HibernateMode，并立即设
+# /sys/power/disk）：
+#   shutdown  = 写镜像后直接断电（云固件默认；恢复由固件上电时接管）
+#   platform  = 交给 systemd/ACPI 默认（不管理；部分内核在云固件下会静默回滚）
+#   reboot / suspend / test_resume = 透传给 systemd
+# 空值或未设置按 shutdown 处理。
+MWVD_HIBERNATE_DISK_MODE=shutdown

@@ -1,0 +1,15 @@
+[Unit]
+Description=Configure MWVD firmware-declared hibernate partition
+ConditionPathExists=/dev/mwvd-control
+After=local-fs.target
+Before=systemd-hibernate.service systemd-hybrid-sleep.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/mwvd/mwvd-hibernate-setup apply
+TimeoutStartSec=60
+# 无声明 / usage 不是 Linux swap 属正常无操作，不作为启动失败
+SuccessExitStatus=0 10
+
+[Install]
+WantedBy=multi-user.target

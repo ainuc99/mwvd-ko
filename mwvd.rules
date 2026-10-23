@@ -1,0 +1,42 @@
+# mwvd* 设备事件处理规则
+
+# ------------------------------------------------------------
+# 第一部分：监视元数据变化
+# ------------------------------------------------------------
+ACTION!="remove", SUBSYSTEM=="block", KERNEL=="mwvd*", OPTIONS+="watch"
+
+# ------------------------------------------------------------
+# 第二部分：持久化存储链接
+# ------------------------------------------------------------
+ACTION=="remove", GOTO="mwvd_end"
+SUBSYSTEM!="block", GOTO="mwvd_end"
+KERNEL!="mwvd*", GOTO="mwvd_end"
+
+# 忽略跨越整个磁盘的分区
+TEST=="whole_disk", GOTO="mwvd_end"
+
+# 为分区导入父磁盘的 ID_* 信息（除 ID_FS_* 外）
+ENV{DEVTYPE}=="partition", \
+  IMPORT{parent}="ID_[!F]*", IMPORT{parent}="ID_", \
+  IMPORT{parent}="ID_F[!S]*", IMPORT{parent}="ID_F", \
+  IMPORT{parent}="ID_FS[!_]*", IMPORT{parent}="ID_FS"
+
+# 生成 by-path 链接
+ENV{DEVTYPE}=="disk", DEVPATH!="*/virtual/*", IMPORT{builtin}="path_id"
+ENV{DEVTYPE}=="disk", ENV{ID_PATH}=="?*", SYMLINK+="disk/by-path/$env{ID_PATH}"
+ENV{DEVTYPE}=="partition", ENV{ID_PATH}=="?*", SYMLINK+="disk/by-path/$env{ID_PATH}-part%n"
+
+# 探测文件系统元数据（生成 by-uuid / by-label）
+IMPORT{builtin}="blkid"
+ENV{ID_FS_USAGE}=="filesystem|other|crypto", ENV{ID_FS_UUID_ENC}=="?*", SYMLINK+="disk/by-uuid/$env{ID_FS_UUID_ENC}"
+ENV{ID_FS_USAGE}=="filesystem|other|crypto", ENV{ID_FS_LABEL_ENC}=="?*", SYMLINK+="disk/by-label/$env{ID_FS_LABEL_ENC}"
+
+# 生成 by-id/wwn 链接（如果设备提供 WWN）
+ENV{DEVTYPE}=="disk", ENV{ID_WWN_WITH_EXTENSION}=="?*", SYMLINK+="disk/by-id/wwn-$env{ID_WWN_WITH_EXTENSION}"
+ENV{DEVTYPE}=="partition", ENV{ID_WWN_WITH_EXTENSION}=="?*", SYMLINK+="disk/by-id/wwn-$env{ID_WWN_WITH_EXTENSION}-part%n"
+
+# 生成 by-partuuid / by-partlabel 链接（GPT 分区表）
+ENV{ID_PART_ENTRY_UUID}=="?*", SYMLINK+="disk/by-partuuid/$env{ID_PART_ENTRY_UUID}"
+ENV{ID_PART_ENTRY_SCHEME}=="gpt", ENV{ID_PART_ENTRY_NAME}=="?*", SYMLINK+="disk/by-partlabel/$env{ID_PART_ENTRY_NAME}"
+
+LABEL="mwvd_end"

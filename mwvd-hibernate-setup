@@ -1,0 +1,377 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+# Copyright (c) 2026 LU WEIFENG (wave.lu@gmail.com)
+# 版权所有 (c) 2026 陆伟峰
+#
+# 云固件 MWVD 休眠分区自动配置 helper
+#
+# 由 udev 规则 / systemd oneshot 服务触发；全部逻辑使用 shell 与发行版已有命令。
+# 不新增用户态二进制，不执行 mkswap/mkfs/swapoff。
+#
+# 设计依据：design/HIBERNATE-UDEV-AUTOCONFIG-DESIGN.md §5.4
+#
+# 退出码：
+#   0  配置成功 / 无休眠声明 / 无需操作
+#   10 usage 不是 Linux swap（systemd 视为成功）
+#   20 UUID / 分区 / swap / 容量不符合要求
+#   30 swapon 或发行版适配器失败
+#   1  内部错误（缺少命令、配置解析失败等）
+
+set -eu
+
+SYSFS_FILE="${MWVD_HIBERNATE_SYSFS:-/sys/class/misc/mwvd-control/hibernate}"
+CONFIG_FILE="${MWVD_HIBERNATE_CONFIG:-/etc/mwvd/hibernate.conf}"
+DEFAULT_FILE="${MWVD_HIBERNATE_DEFAULT:-/etc/default/mwvd-hibernate}"
+LOCK_FILE="${MWVD_HIBERNATE_LOCK:-/run/lock/mwvd-hibernate-setup.lock}"
+LIB_DIR="${MWVD_LIB_DIR:-/usr/lib/mwvd}"
+SYSFS_WAIT_SECONDS="${MWVD_HIBERNATE_SYSFS_WAIT_SECONDS:-5}"
+DEVICE_WAIT_SECONDS="${MWVD_HIBERNATE_DEVICE_WAIT_SECONDS:-30}"
+
+MWVD_HIBERNATE_AUTOCONFIG=1
+MWVD_HIBERNATE_ACTIVATE_SWAP=1
+MWVD_HIBERNATE_MANAGE_BOOT=1
+MWVD_HIBERNATE_DISK_MODE=shutdown
+
+log() {
+  logger -t mwvd-hibernate "$*" 2>/dev/null || true
+  printf '%s: %s\n' "mwvd-hibernate" "$*" >&2
+}
+
+warn() {
+  log "WARN: $*"
+}
+
+die() {
+  local code="$1"
+  shift
+  log "ERROR: $*"
+  exit "$code"
+}
+
+usage() {
+  printf '%s\n' "Usage: $0 apply" >&2
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 ||
+    die 1 "required command not found: $1"
+}
+
+load_policy() {
+  if [ -r "$DEFAULT_FILE" ]; then
+    # 配置文件由 root 维护；与发行版 /etc/default 惯例一致，直接 source。
+    # shellcheck disable=SC1090
+    . "$DEFAULT_FILE"
+  fi
+
+  MWVD_HIBERNATE_AUTOCONFIG="${MWVD_HIBERNATE_AUTOCONFIG:-1}"
+  MWVD_HIBERNATE_ACTIVATE_SWAP="${MWVD_HIBERNATE_ACTIVATE_SWAP:-1}"
+  MWVD_HIBERNATE_MANAGE_BOOT="${MWVD_HIBERNATE_MANAGE_BOOT:-1}"
+  MWVD_HIBERNATE_DISK_MODE="${MWVD_HIBERNATE_DISK_MODE:-shutdown}"
+  export MWVD_HIBERNATE_DISK_MODE
+}
+
+wait_for_sysfs() {
+  local i=0 attempts
+  attempts=$((SYSFS_WAIT_SECONDS * 10))
+  [ "$attempts" -gt 0 ] || attempts=1
+
+  while [ "$i" -lt "$attempts" ]; do
+    [ -s "$SYSFS_FILE" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+read_hibernate_sysfs() {
+  valid=""
+  usage=""
+  resolved=""
+  part_uuid=""
+  device_path=""
+  key=""
+  value=""
+
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    case "$key" in
+      valid) valid="$value" ;;
+      usage) usage="$value" ;;
+      resolved) resolved="$value" ;;
+      part_uuid) part_uuid="$value" ;;
+      device_path) device_path="$value" ;;
+    esac
+  done < "$SYSFS_FILE"
+}
+
+validate_part_uuid() {
+  local value="$1"
+
+  if printf '%s\n' "$value" |
+     grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    scheme="gpt"
+    return 0
+  fi
+
+  if printf '%s\n' "$value" |
+     grep -Eq '^[0-9a-f]{8}(-[0-9a-f]{2})?$'; then
+    scheme="mbr"
+    return 0
+  fi
+
+  return 1
+}
+
+canonical_path() {
+  local path="$1"
+  readlink -f "$path" 2>/dev/null || printf '%s\n' "$path"
+}
+
+reject_mwvd_device() {
+  local path="$1"
+  local real
+  real="$(canonical_path "$path")"
+  case "$real" in
+    /dev/mwvd*) return 1 ;;
+  esac
+  return 0
+}
+
+resolve_device() {
+  local by_partuuid="/dev/disk/by-partuuid/$part_uuid"
+  local i=0 attempts
+  local candidate=""
+
+  attempts=$((DEVICE_WAIT_SECONDS * 2))
+  [ "$attempts" -gt 0 ] || attempts=1
+
+  while [ "$i" -lt "$attempts" ]; do
+    if [ -b "$by_partuuid" ]; then
+      candidate="$by_partuuid"
+      break
+    fi
+
+    if [ "$resolved" = "1" ] && [ -n "$device_path" ] && [ -b "$device_path" ]; then
+      candidate="$device_path"
+      break
+    fi
+
+    sleep 0.5
+    i=$((i + 1))
+  done
+
+  [ -n "$candidate" ] || return 1
+
+  if ! reject_mwvd_device "$candidate"; then
+    warn "refusing /dev/mwvd* device: $candidate"
+    return 1
+  fi
+
+  printf '%s\n' "$candidate"
+}
+
+swap_type() {
+  blkid -p -s TYPE -o value "$1" 2>/dev/null || true
+}
+
+swap_uuid_of() {
+  blkid -p -s UUID -o value "$1" 2>/dev/null || true
+}
+
+is_swap_active() {
+  local target real name
+  target="$(canonical_path "$1")"
+
+  for name in $(swapon --show=NAME --noheadings 2>/dev/null || true); do
+    [ -n "$name" ] || continue
+    real="$(canonical_path "$name")"
+    [ "$real" = "$target" ] && return 0
+  done
+
+  return 1
+}
+
+config_value() {
+  local key="$1"
+  local k="" v=""
+
+  [ -f "$CONFIG_FILE" ] || return 1
+
+  while IFS='=' read -r k v || [ -n "$k" ]; do
+    if [ "$k" = "$key" ]; then
+      printf '%s\n' "$v"
+      return 0
+    fi
+  done < "$CONFIG_FILE"
+
+  return 1
+}
+
+config_is_current() {
+  [ "$(config_value PART_UUID || true)" = "$part_uuid" ] &&
+    [ "$(config_value SWAP_UUID || true)" = "$swap_uuid" ] &&
+    [ "$(config_value SWAP_DEVICE || true)" = "$device" ] &&
+    [ "$(config_value USAGE || true)" = "1" ] &&
+    [ "$(config_value SCHEME || true)" = "$scheme" ]
+}
+
+write_config() {
+  local dir tmp generated_at
+
+  dir="$(dirname "$CONFIG_FILE")"
+  mkdir -p "$dir" || die 1 "cannot create $dir"
+
+  tmp="$(mktemp "${CONFIG_FILE}.mwvd.XXXXXX")" ||
+    die 1 "cannot create temporary config in $dir"
+  generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  cat > "$tmp" <<EOF
+# Generated by mwvd-hibernate-setup; do not edit
+MWVD_HIBERNATE_VERSION=1
+PART_UUID=$part_uuid
+SWAP_DEVICE=$device
+SWAP_UUID=$swap_uuid
+USAGE=1
+SCHEME=$scheme
+GENERATED_AT=$generated_at
+EOF
+
+  chmod 0644 "$tmp" || {
+    rm -f "$tmp"
+    die 1 "cannot chmod temporary config"
+  }
+
+  if [ -f "$CONFIG_FILE" ]; then
+    cp -f "$CONFIG_FILE" "${CONFIG_FILE}.mwvd.bak" || {
+      rm -f "$tmp"
+      die 1 "cannot back up $CONFIG_FILE"
+    }
+  fi
+
+  mv -f "$tmp" "$CONFIG_FILE" || {
+    rm -f "$tmp"
+    die 1 "cannot install $CONFIG_FILE"
+  }
+}
+
+main() {
+  local mem_kb mem_bytes dev_bytes type swap_uuid
+  local device config_changed=0
+
+  case "${1:-apply}" in
+    apply) ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+
+  load_policy
+  if [ "$MWVD_HIBERNATE_AUTOCONFIG" != "1" ]; then
+    log "autoconfig disabled by $DEFAULT_FILE"
+    exit 0
+  fi
+
+  need_command flock
+  mkdir -p "$(dirname "$LOCK_FILE")" || die 1 "cannot create lock directory"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "another instance is running; skip"
+    exit 0
+  fi
+
+  if ! wait_for_sysfs; then
+    log "hibernate sysfs not available: $SYSFS_FILE; skip"
+    exit 0
+  fi
+
+  read_hibernate_sysfs
+
+  if [ "$valid" != "1" ]; then
+    log "firmware did not declare a hibernate partition; skip"
+    exit 0
+  fi
+
+  if [ "$usage" != "1" ]; then
+    log "hibernate partition usage=$usage is not Linux swap; skip"
+    exit 10
+  fi
+
+  part_uuid="$(printf '%s' "$part_uuid" | tr 'A-F' 'a-f')"
+  validate_part_uuid "$part_uuid" ||
+    die 20 "invalid hibernate partition UUID: $part_uuid"
+
+  need_command blkid
+  device="$(resolve_device || true)"
+  [ -n "$device" ] ||
+    die 20 "hibernate partition not found: part_uuid=$part_uuid"
+
+  type="$(swap_type "$device")"
+  if [ "$type" != "swap" ]; then
+    die 20 "partition is not Linux swap (type=${type:-none}); refusing to mkswap: $device"
+  fi
+
+  swap_uuid="$(swap_uuid_of "$device")"
+  [ -n "$swap_uuid" ] ||
+    die 20 "swap partition has no UUID; cannot build resume=UUID=: $device"
+  printf '%s\n' "$swap_uuid" |
+    grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' ||
+    die 20 "swap UUID is not a standard UUID: $swap_uuid"
+  swap_uuid="$(printf '%s' "$swap_uuid" | tr 'A-F' 'a-f')"
+
+  case "$device" in
+    /dev/*) ;;
+    *) die 20 "resolved device is not under /dev: $device" ;;
+  esac
+
+  need_command blockdev
+  mem_kb="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)"
+  [ -n "$mem_kb" ] || die 1 "cannot read MemTotal from /proc/meminfo"
+  mem_bytes=$((mem_kb * 1024))
+  dev_bytes="$(blockdev --getsize64 "$device" 2>/dev/null || true)"
+  [ -n "$dev_bytes" ] || die 1 "cannot read size of $device"
+
+  if [ "$dev_bytes" -lt "$mem_bytes" ]; then
+    die 20 "hibernate partition too small: ${dev_bytes} < ${mem_bytes} bytes"
+  fi
+  if [ "$dev_bytes" -lt $((mem_bytes * 2)) ]; then
+    warn "hibernate partition is smaller than 2x RAM: ${dev_bytes} < $((mem_bytes * 2)) bytes"
+  fi
+
+  if [ "$MWVD_HIBERNATE_ACTIVATE_SWAP" = "1" ]; then
+    need_command swapon
+    if is_swap_active "$device"; then
+      log "swap already active: $device"
+    else
+      log "activating swap: $device"
+      swapon "$device" || die 30 "swapon failed: $device"
+    fi
+  else
+    log "swap activation disabled by $DEFAULT_FILE"
+  fi
+
+  if config_is_current; then
+    log "configuration unchanged: $CONFIG_FILE"
+  else
+    write_config
+    config_changed=1
+    log "configuration updated: $CONFIG_FILE"
+  fi
+
+  if [ ! -r "$LIB_DIR/mwvd-distro.sh" ]; then
+    die 1 "distro adapter library not found: $LIB_DIR/mwvd-distro.sh"
+  fi
+  # shellcheck disable=SC1090
+  . "$LIB_DIR/mwvd-distro.sh"
+
+  if ! mwvd_adapter_apply "$part_uuid" "$swap_uuid" "$device"; then
+    die 30 "distro adapter failed"
+  fi
+
+  if [ "$config_changed" = "1" ]; then
+    log "hibernate configuration applied: part_uuid=$part_uuid swap_uuid=$swap_uuid"
+  fi
+  exit 0
+}
+
+main "$@"
